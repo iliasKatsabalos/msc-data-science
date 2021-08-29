@@ -1,0 +1,1336 @@
+---
+title: Time Series and Forecasting Methods
+author: Ilias Katsampalos
+date: May 28, 2021
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+  pdf_document: default
+---
+First we will read the data.
+```{r, results='hide'}
+library("readxl")
+library("FinTS")
+library("urca")
+library("tsoutliers")
+library("tseries")
+library("ggplot2")
+library("tidyr")
+library("purrr")
+library("ggcorrplot")
+library("fGarch")
+library("rugarch")
+jp <- read_excel("JP_MORGAN_US_FUNDS.xlsx",col_names = TRUE)
+jp_x <- read_excel("JP_MORGAN_US_FUNDS.xlsx",col_names = TRUE, sheet = "Factors")
+```
+
+# 1. Preprocessing
+Remove the first row and work only with the abbreviations of the mutual funds
+```{r}
+jp <- jp[-1,]
+```
+
+We will rename the column that refers to time as `t`. From the independent variables, we will also rename the column `Mkt-RF` to `MKTRF` in order to align with the rest of the naming.
+```{r}
+names(jp)[1] <- "t"
+names(jp_x)[1] <- "t"
+names(jp_x)[2] <- "MKTRF"
+jp_x[2:ncol(jp_x)] <- jp_x[2:ncol(jp_x)] / 100
+```
+
+Cast all columns as numeric except of the first which indicates time
+```{r}
+jp[,2:length(colnames(jp))] <- sapply(jp[,2:length(colnames(jp))], as.numeric)
+```
+
+Finally, in order to have the same format of timestamps, we will copy the column from the dependent variables to the independent variables.
+```{r}
+jp_x$t <- jp$t
+```
+We will also define some functions in order to avoid code replication. 
+One function creates the diagnostic plots of the residuals.
+```{r}
+residuals_diagnostic_plots <- function(model, lag) {
+  
+  if (isS4(model)){
+    resid <- model@residuals
+  }else{
+    resid <- model$residuals
+  }
+  
+  par(mfrow=c(3,2), mar=c(2,2,2,2)) # set up the graphics
+  acf(resid, lag, main="")
+  title("ACF of residuals")
+  pacf(resid, lag, main="")
+  title("PACF of residuals")
+  acf(resid^2, lag, main="")
+  title("ACF of squared residuals")
+  pacf(resid^2, lag, main="")
+  title("PACF of squared residuals")
+  plot(resid, type='p')
+  title("Scatterplot of Residuals")
+  abline(h=0, col="blue", lty=3)
+  qqnorm(resid, main="")
+  qqline(resid, col="blue" ,lty=3)
+  title("Normal QQplot of residuals")
+}
+```
+Another function will run the autocorrelation, homoscedasticity and normality tests on the residuals.
+```{r}
+residuals_assumptions_tests <- function(model, lag){
+  
+  if (isS4(model)){
+    resid <- model@residuals
+  }else{
+    resid <- model$residuals
+  }
+  
+  bt <- Box.test(resid,lag = lag)
+  at <- ArchTest (resid, lags = lag)
+  sw <- shapiro.test(resid)
+  cat("",
+      "Box Test on Residuals/p-value:", bt$p.value, "\n",
+      "ARCH LM Test on Residuals/p-value:", at$p.value, "\n",
+      "Shapiro-Wilk Test on Residuals/p-value:", sw$p.value
+  )
+}
+```
+
+Another function will calculate $\frac{\hat{\beta}}{ s.e \hat{\beta}}$ for the estimated arima models, in order to assess $$H_0: \beta = 0, H_1: \beta \ne 0$$
+
+```{r}
+arima_coefficients_test_stats <- function(model){
+  coefficients <- model$coef[model$coef!=0]
+  standard_errors <- sqrt(diag(model$var.coef))
+  return (coefficients / standard_errors)
+}
+```
+
+# 2. ARMA EDA
+First we will have a look at the data in order to familiarize ourselves with the funds. In the table produced we obtain the following information:
+
+* the mean return of the fund
+* the standard deviation of the fund
+* the p-value of the `Box-Pierce` test regarding the autocorrelation of the series
+* the p-value of the `Ljung-Box` test regarding the autocorrelation of the series
+* the p-value of the `Jearque-Bera` test regarding the normality of the series
+
+```{r}
+mean <- apply(jp[,2:dim(jp)[2]], 2, mean, na.rm=TRUE)
+sd <- apply(jp[,2:dim(jp)[2]], 2, sd, na.rm=TRUE)
+box_tests <- apply(jp[,2:dim(jp)[2]],  2, Box.test, lag=12)
+bp_pvalues_l12 <- lapply(box_tests,function(v){v$p.value})
+box_tests <- apply(jp[,2:dim(jp)[2]],  2, Box.test, lag=12, type="Ljung-Box")
+lb_pvalues_l12 <- lapply(box_tests,function(v){v$p.value})
+jb_tests <- apply(jp[,2:dim(jp)[2]], 2, function(x){jarque.bera.test(x[!is.na(x)])}) 
+jb_pvalues <- lapply(jb_tests,function(v){v$p.value})
+jp_eda <- cbind(mean, sd, bp_pvalues_l12, lb_pvalues_l12, jb_pvalues)
+jp_eda
+```
+Based in the p-values of the `Ljung-Box` test, we can spot the funds `JVAAX` and `VHIAX` which show traces of autocorrelation. As a result it might be suitable to model them using a time-series model.
+
+Plotting the `VHIAX` fund we obtain:
+```{r}
+par(mfrow=c(1,2))
+plot(x=jp$t
+     ,y=jp$VHIAX
+     ,type="l"
+     ,col="blue"
+     ,main="VHIAX Monthly Returns"
+     ,xlab = "time"
+     ,ylab= "returns"
+     ,xlim = as.POSIXct(c("1999-01-01","2020-01-01"))
+)
+plot(
+  density(
+    jp$VHIAX[!is.na(jp$VHIAX)]
+  )
+  ,main="VHIAX density"
+  ,col="blue"
+)
+abline(v = mean(jp$VHIAX, na.rm=TRUE), col="black", lty=3)
+legend(x = "topleft"
+       ,legend = c("density", "mean")
+       ,lty = c(1, 2)
+       ,col = c("blue", "black")
+       ,lwd = 1)
+
+```
+
+The initial fluctuations of the series will lead to serious heteroscedasticity issues. For that reason, we will discard this series.
+
+Plotting the `JVAAX` fund we obtain:
+```{r}
+par(mfrow=c(1,2))
+plot(x=jp$t
+     ,y=jp$JVAAX
+     ,type="l"
+     ,col="blue"
+     ,main="JVAAX Monthly Returns"
+     ,xlab = "time"
+     ,ylab= "returns"
+     ,xlim = as.POSIXct(c("2005-01-01","2020-01-01"))
+
+)
+plot(
+  density(
+    jp$JVAAX[!is.na(jp$JVAAX)]
+  )
+  ,main="JVAAX density"
+  ,col="blue"
+)
+abline(v = mean(jp$JVAAX, na.rm=TRUE), col="black", lty=3)
+legend(x = "topleft"
+       ,legend = c("density", "mean")
+       ,lty = c(1, 2)
+       ,col = c("blue", "black")
+       ,lwd = 1)
+
+```
+
+ We still have some fluctuations but not as sharp as in `VHIAX` series.
+
+Since we need to model one more series, by relaxing the 95% confidence level of the `Ljung-Box` test to a 90% confidence level, we can consider the fund `JAMCX`. By plotting the fund we we obtain:
+
+```{r}
+par(mfrow=c(1,2))
+plot(x=jp$t
+     ,y=jp$JAMCX
+     ,type="l"
+     ,col="blue"
+     ,main="JAMCX Monthly Returns"
+     ,xlab = "time"
+     ,ylab= "returns"
+     ,xlim = as.POSIXct(c("2005-01-01","2020-01-01"))
+)
+plot(
+  density(
+    jp$JAMCX[!is.na(jp$JAMCX)]
+  )
+  ,main="JAMCX density"
+  ,col="blue"
+)
+abline(v = mean(jp$JAMCX, na.rm=TRUE), col="black", lty=3)
+legend(x = "topleft"
+       ,legend = c("density", "mean")
+       ,lty = c(1, 2)
+       ,col = c("blue", "black")
+       ,lwd = 1)
+
+```
+
+The `JAMCX` will be the second fund that we will work with.
+
+# 3. JVAAX mutual fund - ARMA Modeling
+We will start analyzing the JVAAX mutual fund.
+
+## 3.1 Normality of the JVAAX mutual fund
+```{r}
+par(mfrow=c(1,2))
+plot(x=jp$t
+     ,y=jp$JVAAX 
+     ,type="l"
+     ,col="blue"
+     ,main="JVAAX  Monthly Returns"
+     ,xlab = "time"
+     ,ylab= "returns"
+     ,xlim = as.POSIXct(c("2005-01-01","2020-01-01"))
+)
+plot(
+  density(
+    jp$JVAAX[!is.na(jp$JVAAX)]
+  )
+  ,main="JVAAX  density"
+  ,col="blue"
+)
+abline(v = mean(jp$JVAAX , na.rm=TRUE), col="black", lty=3)
+legend(x = "topleft"
+       ,legend = c("density", "mean")
+       ,lty = c(1, 2)
+       ,col = c("blue", "black")
+       ,lwd = 1)
+
+```
+
+Judging from the two plots, one can observe that the timeseries `JVAAX` seems to osciliate around a certain point which is near to 0. We can also check for the normality of the timeseries, using `Shapiro-Wilk` test as well as a qqplot.
+
+```{r}
+shapiro.test(jp$JVAAX)
+```
+```{r}
+qqnorm(jp$JVAAX, main="Normal QQplot of JVAAX", col='blue')
+qqline(jp$JVAAX)
+```
+
+According to the results of the `Shapiro-Wilk` test, we reject $H_0$ meaning that the time series does not follow a normal distribution. The same conclusion can be extracted from the QQplot as well.
+
+
+## 3.2 Autocorrelations in the JVAAX mutual fund
+Using the `Box-Pierce` and `Ljung-Box` tests, we can see if there is any type of autocorrelation in our series.
+```{r}
+jvaax <- jp$JVAAX [!is.na(jp$JVAAX )]
+Box.test(jvaax, lag=12, type="Box-Pierce")
+```
+```{r}
+Box.test(jvaax, lag=12, type="Ljung-Box")
+```
+For both `Box-Pierce` and `Ljung-Box`, there is enough evidence to reject $H_0: \rho_1=\rho_2=...=\rho_{12}=0$, meaning that there is autocorrelation between $y_t$ and at least one lag of the series.
+
+As a next step, we can check the `ACF` and `PACF` plots for the specific fund.
+```{r}
+par(mfrow=c(1,2))
+acf(jvaax, lag.max = 12, main="Autocorrelations of JVAAX")
+pacf(jvaax, lag.max = 12, main="Partial autocorrelations of JVAAX")
+```
+
+From both the `ACF` and `PACF` plots, we observe multiple lags where autocorrelations appear.
+
+## 3.3 Stationarity Test
+In order to check the stationarity of the model, we will need to perform a unit-root test.
+```{r}
+ur_jvaax = ur.df(jvaax, type="drift", lags = 0)
+summary(ur_jvaax)
+```
+
+A simple Dickey-Fuller test, without any additional lags does not show a good R-squared. As a result, we cannot be sure about the test-statistic of the `Dickey-Fuller` test, which in our case is less than the 1% level of confidence. As a result, we would need to increase the lags used in the `Dickey-Fuller` test in order to achieve a better $R^2$.
+```{r}
+ur_jvaax5 = ur.df(jvaax, type="drift", lags = 5)
+summary(ur_jvaax5)
+```
+Obtaining a small uplift in the adjusted $R^2$, we can still reject $H_0$ which assumes non-stationarity, since the test statistic is smaller than all confidence levels.
+
+## 3.4 Model Estimation
+
+We will plot again the `ACF` and `PACF` of the series `JVAAX`.
+```{r}
+par(mfrow=c(1,2))
+acf(jvaax, lag.max = 12, main="Autocorrelations of JVAAX")
+pacf(jvaax, lag.max = 12, main="Partial autocorrelations of JVAAX")
+```
+
+Judging from the `ACF` and `PACF` plots, we can consider the following models:
+
+* MA(4)
+* MA([4,6])
+* AR(4)
+* AR([4,6])
+* ARMA(p=4,q=4)
+* ARMA(p=[4,6], q=4)
+* ARMA(p=[4,6], q=[4,6])
+
+Following a forward approach, we will start with the simpler models, interpret the assumptions of the residuals and add more lags where needed. In case of obtaining models where all the residual assumptions are met, we will use the `AIC` criterion in order to choose the best model.
+
+### 3.4.1 MA(4)
+We will start with fitting a simple `MA(4)` model.
+```{r}
+ma4 <- arima(jvaax,order = c(0,0,4), fixed = c(0,0,0,NA,NA))
+ma4
+```
+The test statistics of the coefficients are:
+```{r}
+arima_coefficients_test_stats(ma4)
+```
+Even though the test statistic of the intercept is not in the rejection rejection $\pm 1.96$ we will proceed including it in our model, since we want to have an average return.
+
+The AIC criterion is:
+```{r}
+ma4$aic
+```
+Then we need to check the residuals
+```{r}
+residuals_diagnostic_plots(ma4, lag = 24)
+```
+
+Observations:
+
+* From the `ACF` and `PACF` plots of the residuals, we can see the 6th lag as significant, for both the MA and AR part. We will continue the MA part.
+* We seem to have some issues with heteroscedasticity, which we will check further with an ARCH-LM test
+* The scatterplot of the residuals shows traces of heteroscedasticity as well. Additionally from the qqplot we can see that our series is not normally distributed, as there are deviations in the tails of the distribution.
+
+Running the tests we obtain:
+```{r}
+residuals_assumptions_tests(ma4, lag=12)
+```
+Results:
+
+* Although we saw significant lags in the ACF and PACF plots, from the `Box-Pierce` test we do not have enough evidence to reject $H_0$
+* From the `ARCH-LM` test, we reject $H_0$ which assumes homoscedasticity
+* From the `Shapiro-Wilk` test, we reject $H_0$ which assumes normality of the residuals.
+
+### 3.4.2 MA(4,6)
+The next model in the forward selection process will be the MA(4,6)
+```{r}
+ma4_6 <- arima(jvaax,order = c(0,0,6), fixed = c(0,0,0,NA,0,NA,NA))
+ma4_6
+```
+The test statistics of the coefficients are:
+```{r}
+arima_coefficients_test_stats(ma4_6)
+```
+All of the test statistics of the coefficients are in the rejection region. The `AIC` score is:
+```{r}
+ma4_6$aic
+```
+Now the diagnostic plots of the residuals:
+```{r}
+residuals_diagnostic_plots(ma4_6, lag = 12)
+```
+
+Observations:
+
+* We do not seem to have issues with autocorrelation of the residuals
+* We might still have issues with heteroscedasticity
+* The distribution of the residuals is not normal
+
+Runnig the tests we obtain:
+```{r}
+residuals_assumptions_tests(ma4_6, lag = 12)
+```
+The results in short are:
+
+* No issues with autocorrelation
+* Still presence of heteroscedasticity
+* Residuals are not normally distributed
+
+### 3.4.3 AR(4)
+Judging from the initial `ACF` and `PACF` plots of the series, we can fit an `AR(4)` model.
+```{r}
+ar4 <- arima(jvaax,order = c(4,0,0), fixed = c(0,0,0,NA,NA), transform.pars = FALSE)
+ar4
+```
+The test statistics of the coefficients are:
+```{r}
+arima_coefficients_test_stats(ar4)
+```
+The intercept is not in the rejection region. However, we will keep on including it in our model, since we want to model an average return.
+
+The `AIC` score is:
+```{r}
+ar4$aic
+```
+The diagnostic plots of the residuals are:
+```{r}
+residuals_diagnostic_plots(ar4, 12)
+```
+
+We can observe in the `ACF` and `PACF` plots that the 6th lag is still significant. Thus, following the forward approach we will add the `6th` lag in the AR model.
+
+### 3.4.4 AR(4,6)
+
+```{r}
+ar4_6 <- arima(jvaax,order = c(6,0,0), fixed = c(0,0,0,NA,0,NA,NA), transform.pars = FALSE)
+ar4_6
+```
+The test statistics of the coefficients are:
+```{r}
+arima_coefficients_test_stats(ar4_6)
+```
+All of them are in the rejection region so they are significant.
+
+The AIC score of the model is:
+```{r}
+ar4_6$aic
+```
+The diagnostics plots of the residuals are:
+```{r}
+residuals_diagnostic_plots(ar4_6, lag=12)
+```
+
+Observations:
+
+* We do not observe any issues with autocorrelation
+* Heteroscedasticity is still an issue
+* There are deviations from normality in the tails of the qqplot
+
+Running the formal tests we obtain:
+```{r}
+residuals_assumptions_tests(ar4_6, lag=12)
+```
+The same results are also depicted in the tests. We will try to rectify using a more complex model.
+
+### 3.4.5 ARMA(p=[4,6], q=[4,6])
+```{r}
+arma6_6 <- arima(
+  jvaax, 
+  order=c(6,0,6), 
+  fixed = c(0,0,0,NA,0,NA,0,0,0,NA,0,NA,NA),
+  transform.pars = FALSE
+)
+arma6_6
+```
+The test statistics of the coefficients are:
+```{r}
+arima_coefficients_test_stats(arma6_6)
+```
+The coefficient for the `6th` AR term is not significant. Thus we will remove it and proceed with an `ARMA(p=4,q=[4,6])` model.
+
+### 3.4.6 ARMA(p=4, q=[4,6])
+```{r}
+arma4_6 <- arima(
+  jvaax
+  ,order = c(4,0,6)
+  ,fixed = c(0,0,0,NA,0,0,0,NA,0,NA,NA)
+  ,transform.pars = FALSE
+)
+arma4_6
+```
+The test statistics of the coefficients are:
+```{r}
+arima_coefficients_test_stats(arma4_6)
+```
+All the test statistics are in the rejection region, thus we reject $H_0$ stating that each one of them is `0`.
+
+The AIC score is
+```{r}
+arma4_6$aic
+```
+The diagnostic plots of the residuals are:
+```{r}
+residuals_diagnostic_plots(arma4_6, lag=12)
+```
+
+Observations:
+
+* We do not seem to have issues with autocorrelation
+* We still have issues with heteroscedasticity
+* We still have issues with normality
+
+Running the formal tests on the residual assumptions we obtain:
+```{r}
+residuals_assumptions_tests(arma4_6, lag = 12)
+```
+Heteroscedasticity as well as normality of the residuals is still an issue. For heteroscedasticity, by using `24` lags insetad of `12` in the tests we obtain.
+```{r}
+residuals_assumptions_tests(arma4_6, lag = 24)
+```
+By using a higher order of lags, we see that the p-value of the `ARCH-LM` test is not `<0.05`. Thus, the heteroscedasticity that we observe, might be in the error region of the test. Issues still appear though when checking the normality. For that reason, it might be wiser to proceed with `ARCH` or `GARCH` models, which are more suitable in case heteroscedasticity is observed.
+
+## 3.5 chosing the most suitable ARMA model
+From our forward approach, we found 3 models with at least the autocorrelation assumption verified. We will choose the best model based on 2 criteria, the AIC score as well as the complexity of the model, in case the uplift from the AIC score is not significant.
+
+The first model is the `MA(4,6)`.
+```{r}
+ma4_6$aic
+```
+The second model is the `AR(4,6)`.
+```{r}
+ar4_6$aic
+```
+The third model is the `ARMA(p=4,q=[4,6])`.
+```{r}
+arma4_6$aic
+```
+The uplift from `MA(4,6)` to `AR(4,6)` is higher than the uplift from `AR(4,6)` to `ARMA(p=4,q=[4,6])`. In other words, the complexity of adding an MA term in the `AR(4,6)` did not provide a big uplift in the AIC score. Thus, we will choose the `AR(4,6)` as the model with the best fit. 
+
+```{r}
+ar4_6
+```
+
+The model can be expressed as
+
+$$y_t - \delta = \phi_4(y_{t-4} - \delta) + \phi_6(y_{t-6} - \delta) + \epsilon_t$$
+
+Substituting we obtain:
+
+$$y_t - 0.007 = 0.2110(y_{t-4} - 0.007) - 0.2495(y_{t-6} - 0.007) + \epsilon_t$$
+
+Doing some algebra we obtain:
+
+$$y_t = 0.00727 + 0.2110 y_{t-4} - 0.2495y_{t-6} + \epsilon_t$$
+
+# 4. The JAMCX mutual fund - ARMA Modeling
+The second time series that will be analyzed is the JAMCX mutual fund.
+
+## 4.1 Normality of JAMCX mutual fund
+```{r}
+par(mfrow=c(1,2))
+plot(x=jp$t
+     ,y=jp$JAMCX 
+     ,type="l"
+     ,col="blue"
+     ,main="JAMCX  Monthly Returns"
+     ,xlab = "time"
+     ,ylab= "returns"
+     ,xlim = as.POSIXct(c("1995-01-01","2020-01-01"))
+)
+plot(
+  density(
+    jp$JAMCX[!is.na(jp$JAMCX)]
+  )
+  ,main="JAMCX  density"
+  ,col="blue"
+)
+abline(v = mean(jp$JAMCX , na.rm=TRUE), col="black", lty=3)
+legend(x = "topleft"
+       ,legend = c("density", "mean")
+       ,lty = c(1, 2)
+       ,col = c("blue", "black")
+       ,lwd = 1)
+```
+
+Judging from the two plots, one can observe that the timeseries JAMCX seems to osciliate around a certain point which is near to 0. We can also check for the normality of the timeseries, using  Shapiro-Wilk test as well as a qqplot.
+```{r}
+shapiro.test(jp$JAMCX)
+```
+```{r}
+qqnorm(jp$JAMCX, main="Normal QQplot of JAMCX", col='blue')
+qqline(jp$JAMCX)
+```
+
+According to the results of the `Shapiro-Wilk` test, we reject $H_0$ meaning that the time series does not follow a normal distribution. The same conclusion can be extracted from the QQplot as well.
+
+## 4.2 Autocorrelations in the JAMCX mutual fund
+We will use the `Box-Pierce` and `Ljung-Box` test to see if there is any autocorrelation in our series.
+```{r}
+jamcx <- jp$JAMCX [!is.na(jp$JAMCX )]
+Box.test(jamcx, lag=12, type="Box-Pierce")
+```
+```{r}
+Box.test(jamcx, lag=12, type="Ljung-Box")
+```
+In the 10% confidence level, we can reject $H_0: \rho_1 = \rho_2 = ... = \rho_{12} = 0$.
+
+The next step would be to check the `ACF` and `PACF` plots of the fund. 
+```{r}
+par(mfrow=c(1,2))
+acf(jamcx, lag.max = 12, main="Autocorrelations of JAMCX")
+pacf(jamcx, lag.max = 12, main="Partial autocorrelations of JAMCX")
+```
+
+We observe that the `6th` lag could be correlated with $y_t$.
+
+## 4.3 Stationarity Test
+
+In order to check the stationarity of the model, we will need to perform a unit-root test.
+
+```{r}
+ur_jamcx = ur.df(jamcx, type="drift", lags = 0)
+summary(ur_jamcx)
+```
+With a simple `Dickey-Fuller` test, without any additional lags we do not achieve a very high $R^2$. Although we can see that we can reject $H_0$ since the test statistic is smaller than all confidence levels. We will try to achieve a better $R^2$ by including additional lags with an `Augmented Dickey-Fuller` test.
+
+```{r}
+ur_jamcx = ur.df(jamcx, type="drift", lags = 18 )
+summary(ur_jamcx)
+```
+Obtaining a small uplift in the adjusted $R^2$, we can still reject $H_0$ which assumes non-stationarity, since the test statistic in smaller than all confidence levels.
+
+## 4.4 Model Estimation
+We will plot again the `ACF` and `PACF` of the series `JAMCX`
+```{r}
+par(mfrow=c(1,2))
+acf(jamcx, lag.max = 12, main="Autocorrelations of JAMCX")
+pacf(jamcx, lag.max = 12, main="Partial autocorrelations of JAMCX")
+```
+
+Judging from the `ACF` and `PACF` plots, we have the following candidate models:
+
+* MA(6)
+* AR(6)
+* ARMA(6,6)
+
+### 4.4.1 MA(6)
+We will start with fitting a simple `MA(6)` model
+```{r}
+ma6 <- arima(jamcx,order = c(0,0,6), fixed = c(0,0,0,0,0,NA,NA))
+ma6
+```
+The test statistics of the coefficients are:
+```{r}
+arima_coefficients_test_stats(ma6)
+```
+Both of them are in the rejection region, thus we reject $H_0: \beta = 0$ for each one of them.
+
+The AIC score of the model is:
+```{r}
+ma6$aic
+```
+Then we check the residuals.
+```{r}
+residuals_diagnostic_plots(ma6, lag=12)
+```
+
+Observations:
+
+* From tha `ACF` and `PACF` plots of the residuals, we do not observe any issues with autocorrelation
+* From tha `ACF` and `PACF` plots of the squared residuals, we expect issues with heteroscedasticity
+* From the `qqplot` the `JAMCX` series does not seem to follow a normal distribution, since there are deviations in the tails.
+
+Running the tests we obtain
+```{r}
+residuals_assumptions_tests(ma6, lag=12)
+```
+Similar results are obtained from the tests. There are no issues with autocorrelations but heteroscedasticity as well as normality of the residuals persist.
+
+### 4.4.2 AR(6)
+```{r}
+ar6 <-arima(jamcx,order = c(6,0,0), fixed = c(0,0,0,0,0,NA,NA), transform.pars = FALSE)
+ar6
+```
+The test statistics of the coefficients are:
+```{r}
+arima_coefficients_test_stats(ar6)
+```
+Both of them are in the rejection region, thus we reject $H_0: \beta = 0$ for each one of them.
+
+The AIC score of the model is:
+```{r}
+ar6$aic
+```
+Then we need to obtain the diagnostic plots of the residual assumptions.
+```{r}
+residuals_diagnostic_plots(ar6, lag=12)
+```
+
+Running the tests we obtain:
+```{r}
+residuals_assumptions_tests(ar6, 12)
+```
+Similarly to the previous model, we still have issues with heteroscedasticity and normality.
+
+### 4.4.3 ARMA(p=6, q=6)
+```{r}
+arma6_6 <- arima(
+  jamcx
+  ,order = c(6,0,6)
+  ,fixed = c(0,0,0,0,0,NA,0,0,0,0,0,NA,NA)
+  ,transform.pars = FALSE
+)
+arma6_6
+```
+The test statistics of the coefficients are:
+```{r}
+arima_coefficients_test_stats(arma6_6)
+```
+Since the test statistics of the coefficients are not significant, we will discard this model.
+
+## 4.5 Model Selection
+
+The AIC score of the `MA(6)` model is:
+```{r}
+ma6$aic
+```
+The AIC score of the `AR(6)` model is:
+```{r}
+ar6$aic
+```
+The scores are quite similar, with the AR(6) model having a slightly better AIC score. Thus we will consider this model as having the best overall fit.
+```{r}
+ar6
+```
+The model can be expressed as:
+$$y_t - \delta = \phi_6(y_{t-6} - \delta) + \epsilon_t$$
+Substituting we obtain:
+$$y_t - 0.009 = -0.1499(y_{t-6} - 0.009) + \epsilon_t$$
+By doing some algebra we have:
+
+$$y_t = 0.0103 - 0.1499y_{t-6} + \epsilon_t$$
+
+However, since the normality as well as the heteroscedasticty assumptions of the residuals are violated, ARCH or GARCH models should be used in order to rectify the aforementioned issues.
+
+# 5. Regression EDA
+
+For the second part of the exercise, we will develop a regression model. We will model the dependend variables, namely the funds `JVAAX` and `JAMCX` using the independent variables:
+
+* Mkt-Rf
+* SBM
+* HML
+* RMW
+* CMA
+* MOM
+
+In case there are issues of autocorrelation, we will rectify it by modeling the residuals using and ARMA model. In case of heteroscedasticity, we utilize ARCH and GARCH models in order to model the variance.
+
+
+We will start by plotting the indepedent variables.
+```{r}
+jp_x %>%
+  keep(is.numeric) %>%
+  gather() %>%
+  ggplot(aes(x = key, y = value))+
+    geom_boxplot()+
+    ggtitle("Box plot of indepdent variables")+
+    xlab("")
+```
+
+The indepdent variable are mostly centered around zero. We observe quite a lot of outliers, especially in the `RMW`. Looking at the densities of each variable we obtain:
+
+```{r}
+jp_x %>%
+  keep(is.numeric) %>%
+  gather() %>%
+  ggplot(aes(value))+
+    facet_wrap(~key, scales="free_y")+
+    geom_density()+
+    ggtitle("Densities of Independent variables")
+```
+
+From the distribution of the independent variables, we can see that they extend to their left tails. This means that the returns can turn quite negative for specific funds like `MOM` and `RMW`.
+
+Next we will look at the correlation between our independent variables:
+
+```{r}
+corr <- cor(jp_x[,2:ncol(jp_x)])
+ggcorrplot(corr, type = "lower", lab = TRUE, insig = "blank")+
+  ggtitle("Correlation Matrix")
+```
+
+Looking at the correlation matrix, we do not observe any strong correlations between variables, except between `HML` and `CMA`. This is something to bare in mind during the regression modeling.
+
+# 6. The JVAAX mutual fund - Regression Modeling
+
+We will start building a regression model for the `JVAAX` fund. First, we will select the rows from the independent variables for which the dependent variable `JVAAX` is populated.
+```{r}
+X_jvaxx <- jp_x[!is.na(jp$JVAAX),2:ncol(jp_x)]
+```
+Then we will proceed with the step regression algorithm, in order to select the explanatory variables of our regression model.
+```{r}
+all_steps = step(lm(jvaax~., data=X_jvaxx),direction="both")
+```
+```{r}
+r_jvaax = lm(all_steps,data=X_jvaxx)
+summary(r_jvaax)
+```
+Observing the summary of the regression model, we can see that we achieved a good $R^2$ and for each one of the regressors, we reject $H_0: \beta=0$. Additionally, the variable `CMA` which was highly correlated with `HML` was removed during the stepwise regression method.
+
+The next step is to get the diagnostic plots of the residuals.
+```{r}
+residuals_diagnostic_plots(r_jvaax, lag=20)
+```
+
+Observations:
+
+* From the `ACF` and `PACF` plots of the residuals, we observe possible autocorrelation issues
+* From the `ACF` and `PACF` plots of the squared residuals, we observe heteroscedasicity issues
+* It is not clear whether or not the normality assumption is violated. For that reason we will proceed with the formal tests.
+```{r}
+residuals_assumptions_tests(r_jvaax, lag = 20)
+```
+From the test results, we observe that there are not issues with autocorrelation, whereas there are issues with heteroscedasticity and normality of the residuals. For this reason, we will need to model the residuals using a GARCH model.
+
+## 6.1 Heteroscedasticity of the residuals
+We will start by fitting a simple `GARCH(1,0)` model,  using external regressors. We will start using all regressors and we will remove the insignificant variables, as long as the model passes the diagnostic tests.
+
+### 6.1.1 GARCH(1,0)
+```{r}
+spec <- ugarchspec(
+  variance.model = list(
+    model ="sGARCH"
+    ,garchOrder=c(1,0)
+  )
+  ,mean.model = list(
+    include.mean=TRUE
+    ,external.regressors = as.matrix(X_jvaxx)
+    ,armaOrder = c(0,0)
+  )
+  ,distribution.model = "norm"
+)
+modelres <- ugarchfit(spec = spec, data = jvaax)
+modelres
+```
+Observations:
+
+* From the `Robust Errors` section, we observe that $a_1$ is not statistically signifcant
+* From the `Ljung-Box Test on Standardized Residuals` we do not have issuess with autocorrelation
+* From the `Ljung-Box Test on Standardized Squared Residuals` we do not seem to have issues with heteroscedasticity
+* However, from the `ARCH LM Test on the Standardized Squared Residuals`, we seem to have heteroscedasticity issues between lags 4 and 6. We observed the same behaviour from the ACF and PACF plots of the squared residuals, where there was a significant lag on `k=5`
+
+However, instead of experimenting with higher order ARCH models, we will proceed with a GARCH(1,1) model.
+
+### 6.1.2 GARCH(1,1)
+```{r}
+spec <- ugarchspec(
+  variance.model = list(
+    model ="sGARCH"
+    ,garchOrder=c(1,1)
+  )
+  ,mean.model = list(
+    include.mean=TRUE
+    ,external.regressors = as.matrix(X_jvaxx)
+    ,armaOrder = c(0,0)
+  )
+  ,distribution.model = "norm"
+)
+modelres <- ugarchfit(spec = spec, data = jvaax)
+modelres
+```
+Observations:
+
+* From the `Robust Standard Errors` section, we observe that neither $a_1$ nor $\beta_1$ are statistically significant.
+* However, the model passes the tests for autocorrelation and heteroscedasticity (both `ARCH LM` and `Ljung Box`)
+
+Assessing the normality we obtain:
+```{r}
+standardized_residuals <- as.vector(residuals(modelres, standardize=T))
+shapiro.test(standardized_residuals)
+```
+Thus we reject $H_0$ which states that our residuals are normally distributed.
+
+A qqplot on the residuals looks like:
+```{r}
+qqnorm(standardized_residuals)
+qqline(standardized_residuals)
+```
+
+We observe that the right tail of the distribution, as well as the outlier at the left tail, is what is causing mostly the deviations from normality. As a result, the `GARCH(1,1)` did not pass all the tests, using the normal distribution. The next step would be to use a `Student-T` distribution, in order to capture better that fat tails.
+
+### 6.1.3 Garch(1,1) using Student-T
+```{r}
+spec <- ugarchspec(
+  variance.model = list(
+    model ="sGARCH"
+    ,garchOrder=c(1,1)
+  )
+  ,mean.model = list(
+    include.mean=TRUE
+    ,external.regressors = as.matrix(X_jvaxx)
+    ,armaOrder = c(0,0)
+  )
+  ,distribution.model = "std"
+)
+modelres <- ugarchfit(spec = spec, data = jvaax)
+modelres
+```
+Observations:
+
+* From the `Robust Standard Errors` section we observe that the terms $a_1$ and $\beta_1$ are statistically significant. We also observe that $\beta_1$ is much higher than $a_1$, which informs us that the lags of variances affect much more the variance as of time `t` than the lags of the residuals.
+* From the `Ljung-Box Test on Standardized Residuals`, we do not seem to have issues of autocorrelation
+* From the `Ljung-Box Test on Standardized Squared Residuals` as well as the `ARCH LM Tests`, we do not have issues with heteroscedasticity.
+
+The last assumption that we need to confirm is that the distribution of the residuals approximates a Student-t distribution. The `shape` estimation of the GARCH model gives us the degrees of freedom of the `t` distribution.
+
+```{r}
+df <- modelres@fit$robust.matcoef["shape"," Estimate"]
+z<-as.vector(residuals(modelres, standardize=T))
+qqplot(qt(ppoints(z), df = df), z
+       ,xlab = "Theoretical Quantiles"
+       ,ylab = "Sample Quantiles"
+       ,main = "QQplot for Student-t distribution"
+)
+qqline(z)
+```
+
+We observe that we have a much better fit using a `Student-t` distribution as they capture the fat tails better, including the outlier at the left tail. Now, since all our assumptions are met, we will proceed with removing non-significant regressors from our model.
+
+## 6.2 Handling non-significant regressors
+
+The coefficients of the `GARCH(1,1)`, which uses the `Student-t` distribution, passes all diagnostic tests. The coefficients are:
+
+```{r}
+modelres@fit$robust.matcoef
+```
+The regressors `4`,`5` and `6` are non-significant for the model. We will remove one by one, starting from the `4th`.
+```{r}
+spec <- ugarchspec(
+  variance.model = list(
+    model ="sGARCH"
+    ,garchOrder=c(1,1)
+  )
+  ,mean.model = list(
+    include.mean=TRUE
+    ,external.regressors = as.matrix(X_jvaxx[c(-4)])
+    ,armaOrder = c(0,0)
+  )
+  ,distribution.model = "std"
+)
+modelres <- ugarchfit(spec = spec, data = jvaax)
+modelres
+```
+
+The qqplot is:
+```{r}
+df <- modelres@fit$robust.matcoef["shape"," Estimate"]
+z <- as.vector(residuals(modelres, standardize=T))
+qqplot(qt(ppoints(z), df = df), z
+       ,xlab = "Theoretical Quantiles"
+       ,ylab = "Sample Quantiles"
+       ,main = "QQplot for Student-t distribution"
+)
+qqline(z)
+```
+
+Since we still have no issues with the assumptions, we will need to remove regressors `5` and `6` from the original set. We proceed with removing the `5th` regressor.
+
+```{r}
+spec <- ugarchspec(
+  variance.model = list(
+    model ="sGARCH"
+    ,garchOrder=c(1,1)
+  )
+  ,mean.model = list(
+    include.mean=TRUE
+    ,external.regressors = as.matrix(X_jvaxx[c(-4,-5)])
+    ,armaOrder = c(0,0)
+  )
+  ,distribution.model = "std"
+)
+modelres <- ugarchfit(spec = spec, data = jvaax)
+modelres
+```
+The qqplot is
+```{r}
+df <- modelres@fit$robust.matcoef["shape"," Estimate"]
+z <- as.vector(residuals(modelres, standardize=T))
+qqplot(qt(ppoints(z), df = df), z
+       ,xlab = "Theoretical Quantiles"
+       ,ylab = "Sample Quantiles"
+       ,main = "QQplot for Student-t distribution"
+)
+qqline(z)
+```
+
+We still do not observe issues with autocorrelation and heteroscedasticity. Additionally, from the qqplot, one can observe that the `t` distribution still captures the fat tails of the residuals. However, the `4th` regressor (`6th` in the original set of X) is not significant. We will proceed with removing it.
+
+```{r}
+spec <- ugarchspec(
+  variance.model = list(
+    model ="sGARCH"
+    ,garchOrder=c(1,1)
+  )
+  ,mean.model = list(
+    include.mean=TRUE
+    ,external.regressors = as.matrix(X_jvaxx[c(-4,-5, -6)])
+    ,armaOrder = c(0,0)
+  )
+  ,distribution.model = "std"
+)
+modelres <- ugarchfit(spec = spec, data = jvaax)
+modelres
+```
+From the `Robust Estimates` we observe that most coefficients are not significant. Thus we will discard this model.
+
+## 6.3 The final model for JVAAX
+```{r}
+spec <- ugarchspec(
+  variance.model = list(
+    model ="sGARCH"
+    ,garchOrder=c(1,1)
+  )
+  ,mean.model = list(
+    include.mean=TRUE
+    ,external.regressors = as.matrix(X_jvaxx[c(-4,-5)])
+    ,armaOrder = c(0,0)
+  )
+  ,distribution.model = "std"
+)
+modelres <- ugarchfit(spec = spec, data = jvaax)
+modelres
+```
+The qqplot is:
+```{r}
+df <- modelres@fit$robust.matcoef["shape"," Estimate"]
+z<-as.vector(residuals(modelres, standardize=T))
+qqplot(qt(ppoints(z), df = df), z
+       ,xlab = "Theoretical Quantiles"
+       ,ylab = "Sample Quantiles"
+       ,main = "QQplot for Student-t distribution"
+)
+qqline(z)
+```
+
+Since the model passes all diagnostics tests and almost all regressors are significant, we accept it as the model with the best fit for the series `JVAAX`. The model can be expressed as:
+
+$$y_t = \beta_0 + \beta_1 x_{1,t} + \beta_2 x_{2,t} + \beta_3 x_{3,t} + \beta_4 x_{4,t} + \epsilon_t$$
+where $$\epsilon_t |\Phi_{t-1} \sim N(0,\sigma_t^2)$$
+and $$\sigma_t^2 = a_0 + a_1 \epsilon_{t-1}^2 + b_1 \sigma_{t-1}^2$$
+
+Substituting we obtain:
+
+$$y_t = 0.000871 + 0.891129 MKRTF_t + 0.062346 SMB_t + 0.218845 HML_t - 0.033898 MOM_t + \epsilon_t$$
+where $$\epsilon_t |\Phi_{t-1} \sim N(0,\sigma_t^2)$$
+and $$\sigma_t^2 = 0.000006 + 0.113421 \epsilon_{t-1}^2 + 0.825854 \sigma_{t-1}^2$$
+
+# 7. The JAMCX mutual fund - Regression modeling
+We will start building a regression model for the `JAMCX` fund. First, we will select the rows from the independent variables for which the dependent variable `JAMCX` is populated.
+```{r}
+X_jamcx <- jp_x[!is.na(jp$JAMCX),2:ncol(jp_x)]
+```
+Then we will proceed with the step regression algorithm, in order to select explanatory variables for our regression model.
+```{r}
+all_steps = step(lm(jamcx~., data=X_jamcx),direction="both")
+```
+```{r}
+r_jamcx = lm(all_steps,data=X_jamcx)
+summary(r_jamcx)
+```
+Observing the summary of the regression model, we can see that we achieved a good $R^2$ and for each one of the regressors, we reject $H_0: \beta=0$.
+
+The next step is to get the diagnostic plots of the residuals.
+```{r}
+residuals_diagnostic_plots(r_jamcx, lag=20)
+```
+
+Observations:
+
+* From the `ACF` and `PACF` plots of the residuals, we observe possible autocorrelation issues
+* From the `ACF` and `PACF` plots of the squared residuals, we observe heteroscedasicity issues
+* It is not clear whether or not the normality assumption is violated. For that reason we will proceed with the formal tests.
+```{r}
+residuals_assumptions_tests(r_jamcx, lag = 20)
+```
+Observations:
+
+* From the `Box-Pierce` test we reject $H_0$ which assumes independence of residuals
+* The `ARCH LM` test did not show issues of heteroscedasticity
+* In contrast, from the scatterplot of the residuals, we do observe heteroscedasticity
+* From the `Shapiro-Wilk` test, we observe that the residuals are not normally distributed
+
+As a result, we will need to model the residuals of the model, using an ARMA process.
+
+## 7.1 Autocorrelation of the residuals
+Judging from the `ACF` and `PACF` plots of the residuals, we have the following candidate models.
+
+* AR(2)
+* MA(3)
+* AR(2,3)
+
+In order to combine an ARMA model with regression, we will use the `arima` function using external regressions via the parameter `xreg`.
+
+```{r}
+r_ar2 <- arima(
+  jamcx
+  ,order=c(2,0,0)
+  ,fixed=c(0,NA,NA,NA,NA,NA,NA,NA,NA)
+  ,xreg = X_jamcx
+  ,transform.pars = FALSE
+)
+summary(r_ar2)
+```
+We need to check the significance of the coefficients.
+```{r}
+arima_coefficients_test_stats(r_ar2)
+```
+
+Apart from the intercept the rest of the coefficients are significant. We will still include the coefficient term since we want to have an average return in our model.
+
+
+The next step would be to check the residuals.
+```{r}
+residuals_diagnostic_plots(r_ar2, lag = 20)
+```
+
+Observations:
+
+* We have no more issues with autocorrelation
+* We still observe issues with heteroscedasticity and normality.
+
+Running the formal test we obtain:
+```{r}
+residuals_assumptions_tests(r_ar2, 20)
+```
+As observed from the plots as well, we still face issues with heteroscedasticity and normality. For this reason, we will proceed modeling our data with ARCH-GARCH models.
+
+## 7.2 Autocorrelation & heteroscedasticity of the residuals
+Since, after introducing an AR(2) term in our model, the issue of heteroscedasticity re-surfaced, we will need to utilize a GARCH model, modeling both the autocorrelation as well as the heteroscedasticity of the residuals.
+
+### 7.2.1 GARCH(1,0)
+```{r}
+spec <- ugarchspec(
+  variance.model = list(
+    model ="sGARCH"
+    ,garchOrder=c(1,0)
+  )
+  ,mean.model = list(
+    include.mean=TRUE
+    ,external.regressors = as.matrix(X_jamcx)
+    ,armaOrder = c(2,0)
+  )
+  ,distribution.model = "norm"
+  ,fixed.pars = list(ar1=0)
+)
+modelres <- ugarchfit(spec = spec, data = jamcx)
+modelres
+```
+Observations:
+
+* From the `Robust Standard Errors` section, we can observe that the AR(2) component is significant.
+* The $a_1$ coefficient of the GARCH part is significant as well.
+* From the `Ljung-Box Test on Standardized Residuals` we observe that we do have no issues of autocorrelation
+* From the `Ljung-Box Test on Standardized Squared Residuals` we observe that we have heteroscedasticity issues between the lags `2` and `5`
+* From the `ARCH LM Tests` we observe heteroscedasticity issues 
+
+Plotting the residuals we obtain:
+
+```{r}
+residuals_diagnostic_plots(modelres@fit, lag=20)
+```
+
+Observations:
+
+* As observed from before, there are no issues with autocorrelation
+* We have strong evidence for heteroscedasticity. There are many significant lags in the `ACF` and `PACF` plots of the squarred residuals.
+* We have deviations from normality, due to fat tails
+
+For all the aforementioned reasons, we will experiment with an `GARCH(1,1)` model.
+
+### 7.2.2 GARCH(1,1)
+```{r}
+spec <- ugarchspec(
+  variance.model = list(
+    model ="sGARCH"
+    ,garchOrder=c(1,1)
+  )
+  ,mean.model = list(
+    include.mean=TRUE
+    ,external.regressors = as.matrix(X_jamcx)
+    ,armaOrder = c(2,0)
+  )
+  ,distribution.model = "norm"
+  ,fixed.pars = list(ar1=0)
+)
+modelres <- ugarchfit(spec = spec, data = jamcx)
+modelres
+```
+
+Observations:
+
+* From the `Ljung-Box Test on Standardized Residuals` we observe that we have no issues of autocorrelation
+* From the `Ljung-Box Test on Standardized Squared Residuals` we observe that we do not have any issues with heteroscedasticity
+* From the `ARCH LM Tests` we do not observe any heteroscedasticity issues 
+
+Checking the normality we obtain:
+```{r}
+standardized_residuals <- as.vector(residuals(modelres, standardize=T))
+shapiro.test(standardized_residuals)
+```
+We also do not reject $H_0$ of the Shapiro-Wilk test. As a result, the residuals are normally distributed.
+
+## 7.3 Handling non-significant regressors
+
+The `GARCH(1,1)` passes all diagnostic tests. The coefficients are:
+```{r}
+modelres@fit$robust.matcoef
+```
+
+The regressors `5` and `6` are not significant. We will remove them one by one, starting from the regressor `5`.
+```{r}
+spec <- ugarchspec(
+  variance.model = list(
+    model ="sGARCH"
+    ,garchOrder=c(1,1)
+  )
+  ,mean.model = list(
+    include.mean=TRUE
+    ,external.regressors = as.matrix(X_jamcx[c(-5)])
+    ,armaOrder = c(2,0)
+  )
+  ,distribution.model = "norm"
+  ,fixed.pars = list(ar1=0)
+)
+modelres <- ugarchfit(spec = spec, data = jamcx)
+modelres
+```
+Checking the normality we obtain:
+```{r}
+standardized_residuals <- as.vector(residuals(modelres, standardize=T))
+shapiro.test(standardized_residuals)
+```
+All assumptions are still met. However, the regressor `5` (the `6th` regressor in our initial set is still insignificant). We will proceed with removing it.
+```{r}
+spec <- ugarchspec(
+  variance.model = list(
+    model ="sGARCH"
+    ,garchOrder=c(1,1)
+  )
+  ,mean.model = list(
+    include.mean=TRUE
+    ,external.regressors = as.matrix(X_jamcx[c(-5,-6)])
+    ,armaOrder = c(2,0)
+  )
+  ,distribution.model = "norm"
+  ,fixed.pars = list(ar1=0)
+)
+modelres <- ugarchfit(spec = spec, data = jamcx)
+modelres
+```
+Checking the normality we obtain:
+```{r}
+standardized_residuals <- as.vector(residuals(modelres, standardize=T))
+shapiro.test(standardized_residuals)
+```
+All assumptions are met. However, the AR(2) term which was modeled initially turns out non significant in our final model. As a result we will remove it.
+```{r}
+spec <- ugarchspec(
+  variance.model = list(
+    model ="sGARCH"
+    ,garchOrder=c(1,1)
+  )
+  ,mean.model = list(
+    include.mean=TRUE
+    ,external.regressors = as.matrix(X_jamcx[c(-5,-6)])
+    ,armaOrder = c(0,0)
+  )
+  ,distribution.model = "norm"
+)
+modelres <- ugarchfit(spec = spec, data = jamcx)
+modelres
+```
+Checking the normality we obtain:
+```{r}
+standardized_residuals <- as.vector(residuals(modelres, standardize=T))
+shapiro.test(standardized_residuals)
+```
+All assumptions are met, even though we removed the autoregressive term. Just to ensure that no autocorrelations are present, we will plot the `ACF` and `PACF` of the residuals.
+```{r}
+par(mfrow=c(1,2))
+acf(standardized_residuals, 12, main="")
+title("ACF of residuals")
+pacf(standardized_residuals, 12, main="")
+title("PACF of residuals")
+```
+
+We see only one statistically significant lag in the PACF and ACF plots. Combined with the non-rejection of the $H_0$ of the `Ljung-Box`, we can accept that we do not have autocorrelation issues.
+
+## 7.4 The final model for JAMCX
+```{r}
+spec <- ugarchspec(
+  variance.model = list(
+    model ="sGARCH"
+    ,garchOrder=c(1,1)
+  )
+  ,mean.model = list(
+    include.mean=TRUE
+    ,external.regressors = as.matrix(X_jamcx[c(-5,-6)])
+    ,armaOrder = c(0,0)
+  )
+  ,distribution.model = "norm"
+)
+modelres <- ugarchfit(spec = spec, data = jamcx)
+modelres
+```
+Checking the normality we obtain:
+```{r}
+standardized_residuals <- as.vector(residuals(modelres, standardize=T))
+shapiro.test(standardized_residuals)
+```
+Since the model passes all diagnostics tests and almost all regressors are significant, we accept it as the model with the best fit for the series JMACX. The model can be expressed as:
+$$y_t = \beta_0 + \beta_1 x_{1,t} + \beta_2 x_{2,t} + \beta_3 x_{3,t} + \beta_4 x_{4,t} + \epsilon_t$$
+where $$\epsilon_t |\Phi_{t-1} \sim N(0,\sigma_t^2)$$
+and $$\sigma_t^2 = a_0 + a_1 \epsilon_{t-1}^2 + b_1 \sigma_{t-1}^2$$
+
+Substituting we obtain:
+
+$$y_t = 0.002246 + 0.854768 MKRTF_t + 0.227047 SMB_t + 0.241823 HML_t + 0.261317 RMW_t + \epsilon_t$$
+where $$\epsilon_t |\Phi_{t-1} \sim N(0,\sigma_t^2)$$
+and $$\sigma_t^2 = 0.000015 + 0.442508 \epsilon_{t-1}^2 + 0.537350 \sigma_{t-1}^2$$
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
